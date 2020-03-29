@@ -1,194 +1,223 @@
-import sys
+import argparse
 import os
-import numpy as np
+from functools import reduce, partial
+from itertools import accumulate
+
 import cv2
-import scipy
-from scipy.stats import norm
-from scipy.signal import convolve2d
 import math
+import numpy as np
+import scipy
+from scipy.signal import convolve2d
+import scipy.stats as st
+from scipy.ndimage.filters import gaussian_filter
 
 
-def split_rgb(image):
-    """split rgb image to its channels"""
-    red = None
-    green = None
-    blue = None
-    (blue, green, red) = cv2.split(image)
-    return red, green, blue
+def generate_kernel(dim, sigma=0.4):
+    """Returns a 2D Gaussian kernel."""
+    x = np.linspace(-sigma, sigma, dim + 1)
+    kern1d = st.norm.pdf(x)
+    kern2d = np.outer(kern1d, kern1d)
+    return kern2d / kern2d.sum()
 
 
-def generating_kernel(a):
-    """generate a 5x5 kernel"""
-    w_1d = np.array([0.25 - a / 2.0, 0.25, a, 0.25, 0.25 - a / 2.0])
-    return np.outer(w_1d, w_1d)
-
-
-def ireduce(image):
+def reduce_img(image, factor=2, kernel_size=5):
     """reduce image by 1/2"""
-    out = None
-    kernel = generating_kernel(0.4)
+    kernel = generate_kernel(kernel_size)
     outimage = scipy.signal.convolve2d(image, kernel, 'same')
-    out = outimage[::2, ::2]
+    out = outimage[::factor, ::factor]
     return out
 
 
-def iexpand(image):
-    """expand image by factor of 2"""
-    out = None
-    kernel = generating_kernel(0.4)
-    outimage = np.zeros((image.shape[0] * 2, image.shape[1] * 2),
+def expand_img(image, factor=2, kernel_size=5):
+    """expand image by a factor"""
+    kernel = generate_kernel(kernel_size)
+    h, w = image.shape
+    outimage = np.zeros((h * factor, w * factor),
                         dtype=np.float64)
-    outimage[::2, ::2] = image[:, :]
-    out = 4 * scipy.signal.convolve2d(outimage, kernel, 'same')
+    outimage[::factor, ::factor] = image[:, :]
+    out = factor ** 2 * scipy.signal.convolve2d(outimage, kernel, 'same')
     return out
 
 
 def gauss_pyramid(image, levels):
     """create a gaussain pyramid of a given image"""
-    output = []
-    output.append(image)
-    tmp = image
-    for i in range(0, levels):
-        tmp = ireduce(tmp)
-        output.append(tmp)
-    return output
+    return list(accumulate([image] * levels, lambda a, _: reduce_img(a)))
+
+
+def consolidate(img1, img2):
+    """Consolidate images to the same size in case of small offsets"""
+    for i in range(2):
+        if img1.shape[i] > img2.shape[i]:
+            img1 = np.delete(img1, (-1), axis=i)
+    return img1, img2
 
 
 def lapl_pyramid(gauss_pyr):
     """build a laplacian pyramid"""
     output = []
-    k = len(gauss_pyr)
-    for i in range(0, k - 1):
-        gu = gauss_pyr[i]
-        egu = iexpand(gauss_pyr[i + 1])
-        if egu.shape[0] > gu.shape[0]:
-            egu = np.delete(egu, (-1), axis=0)
-        if egu.shape[1] > gu.shape[1]:
-            egu = np.delete(egu, (-1), axis=1)
-        output.append(gu - egu)
-    output.append(gauss_pyr.pop())
+    for i in range(len(gauss_pyr) - 1):
+        gaussian = gauss_pyr[i]
+        expanded = expand_img(gauss_pyr[i + 1])
+        expanded, gaussian = consolidate(expanded, gaussian)
+        output.append(gaussian - expanded)
+    output.append(gauss_pyr[-1])
     return output
 
 
-def blend(lapl_pyr_white, lapl_pyr_black, gauss_pyr_mask):
+def blend_lapl_pyramids(lapl_pyr_white, lapl_pyr_black, gauss_pyr_mask):
     """Blend the two laplacian pyramids by weighting them according to the
     mask.
     """
-    blended_pyr = []
-    k = len(gauss_pyr_mask)
-    for i in range(0, k):
-        p1 = gauss_pyr_mask[i] * lapl_pyr_white[i]
-        p2 = (1 - gauss_pyr_mask[i]) * lapl_pyr_black[i]
-        blended_pyr.append(p1 + p2)
-    return blended_pyr
+
+    def blend_layer(white, black, mask):
+        return mask * white + (1 - mask) * black
+
+    return [blend_layer(*layers) for layers in
+            zip(lapl_pyr_white, lapl_pyr_black, gauss_pyr_mask)]
 
 
-def collapse(lapl_pyr):
+def collapse_pyramid(lapl_pyr):
     """Reconstruct the image based on its laplacian pyramid."""
-    output = None
-    output = np.zeros((lapl_pyr[0].shape[0], lapl_pyr[0].shape[1]),
-                      dtype=np.float64)
-    for i in range(len(lapl_pyr) - 1, 0, -1):
-        lap = iexpand(lapl_pyr[i])
-        lapb = lapl_pyr[i - 1]
-        if lap.shape[0] > lapb.shape[0]:
-            lap = np.delete(lap, (-1), axis=0)
-        if lap.shape[1] > lapb.shape[1]:
-            lap = np.delete(lap, (-1), axis=1)
-        tmp = lap + lapb
-        lapl_pyr.pop()
-        lapl_pyr.pop()
-        lapl_pyr.append(tmp)
-        output = tmp
-    return output
+
+    def collapse(big_layer, small_layer):
+        expanded = expand_img(big_layer)
+        return sum(consolidate(expanded, small_layer))
+
+    return reduce(collapse, lapl_pyr[::-1])
 
 
-def main():
-    image1 = cv2.imread('apple.jpg')
-    image2 = cv2.imread('orange.jpg')
-    mask = cv2.imread('mask512.jpg')
-    r1 = None
-    g1 = None
-    b1 = None
-    r2 = None
-    g2 = None
-    b2 = None
-    rm = None
-    gm = None
-    bm = None
+def gauss_pyramid_bgr(image):
+    bgr = cv2.split(image)
+    bgr = [c.astype(float) for c in bgr]
+    min_size = min(bgr[0].shape)
+    # at least 16x16 at the highest level.
+    depth = int(math.floor(math.log(min_size, 2))) - 4
+    return [gauss_pyramid(c, depth) for c in bgr]
 
-    (r1, g1, b1) = split_rgb(image1)
-    (r2, g2, b2) = split_rgb(image2)
-    (rm, gm, bm) = split_rgb(mask)
 
-    r1 = r1.astype(float)
-    g1 = g1.astype(float)
-    b1 = b1.astype(float)
+def lapl_pyramid_bgr(pyramid):
+    return [lapl_pyramid(c) for c in pyramid]
 
-    r2 = r2.astype(float)
-    g2 = g2.astype(float)
-    b2 = b2.astype(float)
 
-    rm = rm.astype(float) / 255
-    gm = gm.astype(float) / 255
-    bm = bm.astype(float) / 255
+def blend_images(images, mask):
+    def bound(img):
+        img[img < 0] = 0
+        img[img > 255] = 255
+        return img.astype(np.uint8)
 
-    # Automatically figure out the size
-    min_size = min(r1.shape)
-    depth = int(math.floor(
-        math.log(min_size, 2))) - 4  # at least 16x16 at the highest level.
+    gauss_mask = gauss_pyramid_bgr(mask)
+    lapl_pyramids = [lapl_pyramid_bgr(gauss_pyramid_bgr(img))
+                     for img in images]
 
-    gauss_pyr_maskr = gauss_pyramid(rm, depth)
-    gauss_pyr_maskg = gauss_pyramid(gm, depth)
-    gauss_pyr_maskb = gauss_pyramid(bm, depth)
+    collapsed = [
+            collapse_pyramid(blend_lapl_pyramids(lapl1, lapl2, gauss_mask)) for
+            lapl1, lapl2, gauss_mask in zip(*lapl_pyramids, gauss_mask)]
 
-    gauss_pyr_image1r = gauss_pyramid(r1, depth)
-    gauss_pyr_image1g = gauss_pyramid(g1, depth)
-    gauss_pyr_image1b = gauss_pyramid(b1, depth)
+    collapsed = [bound(c) for c in collapsed]
 
-    gauss_pyr_image2r = gauss_pyramid(r2, depth)
-    gauss_pyr_image2g = gauss_pyramid(g2, depth)
-    gauss_pyr_image2b = gauss_pyramid(b2, depth)
+    return np.dstack(np.array(collapsed))
 
-    lapl_pyr_image1r = lapl_pyramid(gauss_pyr_image1r)
-    lapl_pyr_image1g = lapl_pyramid(gauss_pyr_image1g)
-    lapl_pyr_image1b = lapl_pyramid(gauss_pyr_image1b)
 
-    lapl_pyr_image2r = lapl_pyramid(gauss_pyr_image2r)
-    lapl_pyr_image2g = lapl_pyramid(gauss_pyr_image2g)
-    lapl_pyr_image2b = lapl_pyramid(gauss_pyr_image2b)
+def make_mask(dimensions, split):
+    h, w, d = dimensions
+    split = split if split <= w else w
+    split = split if split >= 0 else 0
+    left = np.zeros((h, split, d))
+    right = np.full((h, w - split, d), 1)
+    return np.concatenate((left, right), axis=1)
 
-    outpyrr = blend(lapl_pyr_image2r, lapl_pyr_image1r, gauss_pyr_maskr)
-    outpyrg = blend(lapl_pyr_image2g, lapl_pyr_image1g, gauss_pyr_maskg)
-    outpyrb = blend(lapl_pyr_image2b, lapl_pyr_image1b, gauss_pyr_maskb)
 
-    outimgr = collapse(
-        blend(lapl_pyr_image2r, lapl_pyr_image1r, gauss_pyr_maskr))
-    outimgg = collapse(
-        blend(lapl_pyr_image2g, lapl_pyr_image1g, gauss_pyr_maskg))
-    outimgb = collapse(
-        blend(lapl_pyr_image2b, lapl_pyr_image1b, gauss_pyr_maskb))
-    # blending sometimes results in slightly out of bound numbers.
-    outimgr[outimgr < 0] = 0
-    outimgr[outimgr > 255] = 255
-    outimgr = outimgr.astype(np.uint8)
+def move_split(dimensions, split, direction, speed):
+    direction = 1 if direction else - 1
+    split = split + direction * speed
+    return make_mask(dimensions, split), split
 
-    outimgg[outimgg < 0] = 0
-    outimgg[outimgg > 255] = 255
-    outimgg = outimgg.astype(np.uint8)
 
-    outimgb[outimgb < 0] = 0
-    outimgb[outimgb > 255] = 255
-    outimgb = outimgb.astype(np.uint8)
+def process_img(images, split=None, direction=True, speed=1):
+    dimensions = h, w, d = images[0].shape
+    split = w // 2 if split is None else split
+    mask, split = move_split(dimensions, split, direction, speed)
+    img = blend_images(images, mask)
+    return img, True, split
 
-    result = np.zeros(image1.shape, dtype=image1.dtype)
-    tmp = []
-    tmp.append(outimgb)
-    tmp.append(outimgg)
-    tmp.append(outimgr)
-    result = cv2.merge(tmp, result)
-    cv2.imwrite('blended.jpg', result)
+
+def save(images, split, out='blended'):
+    img, running, split = process_img(images, split)
+    file_count = 0
+    while True:
+        file_name = '{}_{}.png'.format(out, file_count)
+        if os.path.isfile(file_name):
+            file_count += 1
+            continue
+        cv2.imwrite(file_name, img)
+        print('Saved image to {}'.format(file_name))
+        return img, running, split
+
+
+def close(images, split):
+    return images, False, split
+
+
+def main(filenames, outname):
+    images = [cv2.imread(fn) for fn in filenames]
+
+    for img, filename in zip(images, filenames):
+        if img is None:
+            print('Unable to open image at {}'.format(filename))
+            return
+
+    # check if images are the same size
+    img_shapes = [img.shape for img in images]
+    have_same_dims = lambda a, b: all(a[i] == b[i] for i in range(len(a)))
+    if not reduce(have_same_dims, img_shapes):
+        print('Images must be the same resolution! Instead got:')
+        for filename, size in zip(filenames, img_shapes):
+            print(
+                    'Image {} has size: {}x{}'.format(filename, size[0],
+                                                      size[1]))
+        return
+
+    slow = 3
+    fast = 6
+    right = True
+    left = False
+    keymap = {
+            ord('s'): partial(process_img, direction=left, speed=slow),
+            ord('a'): partial(process_img, direction=left, speed=fast),
+            ord('d'): partial(process_img, direction=right, speed=slow),
+            ord('f'): partial(process_img, direction=right, speed=fast),
+            ord('m'): process_img,
+            ord('w'): partial(save, out=outname),
+            ord('q'): close,
+    }
+
+    img, running, split = process_img(images)
+
+    running = True
+    while running:
+        cv2.imshow('Blended image', img)
+        k = cv2.waitKey(0)
+        if k in keymap.keys():
+            split = None if k == ord('m') else split
+            img, running, split = keymap[k](images, split)
+        else:
+            print('Unassigned key {}'.format(chr(k)))
+
+
+def parse_arguments():
+    desc = 'Image blending software for MWR classes.'
+    parser = argparse.ArgumentParser(description=desc)
+    parser.add_argument('images', nargs=2,
+                        help='Paths to images for blending. As of now the '
+                             'program only supports the blending of two '
+                             'images. These can be separate names or a shell '
+                             'wildcard pattern.')
+    parser.add_argument('-o', '--out', default='blended',
+                        help='First part of output file name. If empty, '
+                             'the image will be named "blended"')
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    main()
+    args = parse_arguments()
+    main(args.images, args.out)

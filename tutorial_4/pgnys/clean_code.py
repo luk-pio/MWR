@@ -6,21 +6,18 @@ import os.path
 # Example of a mixing that takes image and returns processed image and
 # information
 # if program should continue execution
-def close(img, out_file):
-    running = False
-    return img, running
 
 
 def scale_up(img, out_file):
     running = True
-    rows, cols, chans = map(int, img.shape)
+    rows, cols, chans = [int(c) for c in img.shape]
     img = cv2.pyrUp(img, dstsize=(2 * cols, 2 * rows))
     return img, running
 
 
 def scale_down(img, out_file):
     running = True
-    rows, cols, chans = map(int, img.shape)
+    rows, cols, chans = [int(c) for c in img.shape]
     img = cv2.pyrDown(img, dstsize=(cols // 2, rows // 2))
     return img, running
 
